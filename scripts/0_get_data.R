@@ -6,7 +6,7 @@ library(sf)
 # remotes::install_github("https://github.com/emuise/budR")
 library(budR) # has my keys in it
 
-terraOptions(memfrac = 0.90,
+terraOptions(memfrac = 0.9,
              tempdir = "F:\\scratch2")
 
 # bc boundary
@@ -15,12 +15,9 @@ bcb_loc <- here::here(shp_loc, "bcb.shp")
 if (!file.exists(bcb_loc)) {
   # clean and validate bc bounds
   bcb <- bcmaps::bc_bound_hres() %>%
-    st_make_valid() %>%
-    st_combine() %>%
-    st_union() %>%
-    st_make_valid()
+    vect()
   
-  write_sf(bcb, bcb_loc)
+  writeVector(bcb, here::here(shp_loc, "bcb.shp"), overwrite = T)
 }
 
 bcb <- vect(bcb_loc)
@@ -58,47 +55,83 @@ bcb_wgs84 <- bcb %>%
 # trying cropping to bcb_wgs84 ext plus a boundary, also used to determine
 # which provinces/states have large cities for the distance raster
 
-bcb_wgs84_buff <- buffer(bcb_wgs84, 25000)
+bcb_wgs84_buff <- terra::buffer(bcb_wgs84, 25000)
 
 # bc protected areas
 pa_loc <- here::here(shp_loc, "bc_pa_filt.shp")
 
 if (!file.exists(pa_loc)) {
   # get canadian PAs from wdpar
-  cad_pa <-
-    wdpa_fetch("CAN",
-               wait = T,
-               download_dir = here::here("data"))
+  # this is currently broken due to a chromote update
+  # cad_pa <-
+  #   wdpa_fetch("CAN",
+  #              wait = T,
+  #              download_dir = here::here("data"))
+  
+  all_pa <- here::here("data", "shapefiles") %>%
+    list.dirs() %>%
+    str_subset("WDPA") %>%
+    list.files(pattern = "polygons.shp$", full.names = T) %>%
+    map(vect) %>%
+    vect()
+  
+  cad_pa <- all_pa %>%
+    filter(ISO3 == "CAN")
+  
+  # get bc terrestrial PA
+  # currentl broken due to chromote but
+  # bc_pa <- cad_pa %>%
+  #   dplyr::filter(SUB_LOC == "CA-BC") %>%
+  #   st_transform(3005) %>%
+  #   filter(st_geometry_type(.) == "MULTIPOLYGON")
+  # remove point based PAs
   
   # get bc terrestrial PA
   bc_pa <- cad_pa %>%
-    dplyr::filter(SUB_LOC == "CA-BC") %>%
-    st_transform(3005) %>%
-    filter(st_geometry_type(.) == "MULTIPOLYGON")
+    filter(SUB_LOC == "CA-BC") %>%
+    project("epsg:3005")
   # remove point based PAs
   
-  bc_terr_pa <- bc_pa %>%
-    st_make_valid() %>%
-    st_intersection(bcb %>%
-                      st_as_sf())
+  # bc_terr_pa <- bc_pa %>%
+  #   st_make_valid() %>%
+  #   st_intersection(bcb %>%
+  #                     st_as_sf())
   
-  write_sf(bc_pa, here::here(shp_loc, "bc_pa.gpkg"))
-  write_sf(bc_pa, here::here(shp_loc, "bc_pa.shp"))
+  pa_terr <- bc_pa %>%
+    crop(bcb)
+  
+  writeVector(pa_terr, here::here(shp_loc, "bc_pa.gpkg"), overwrite = T)
+  writeVector(pa_terr, here::here(shp_loc, "bc_pa.shp"), overwrite = T)
   
   # filter pa based off bolton et al. (2018)
   # less than 100 ha; in IUCN class Ia Ib II and IV
-  bc_pa_filt <- bc_terr_pa %>%
-    mutate(area = st_area(.) %>%
+  bc_pa_filt <- pa_terr %>%
+    mutate(area = expanse(., unit = "ha") %>%
              as.numeric() %>%
              round(digits = 2)) %>%
     filter(IUCN_CAT %in% c("Ia", "Ib", "II", "IV")) %>%
-    group_by(WDPAID, IUCN_CAT) %>%
-    summarize(
-      area = sum(area),
-      minyear = min(STATUS_YR),
-      maxyear = max(STATUS_YR)
-    ) %>%
-    filter(area > 1e6)
+    filter(area > 100) 
+  
+  bc_pa_filt %>%
+    writeVector(here::here(shp_loc, "bc_pa_filt.shp"), overwrite = T)
+  
+  
+  # this rasterization is mangled. done manually in arcgis
+  # it ends up missing values and values are just completely wrong
+  # use feature to raster tool on bc_pa_filt.shp
+  # then align it manually in R. all it needs is extend(., forests)
+  # sorry this isn't reproducible!!
+  
+  # https://github.com/rspatial/terra/issues/1797
+  # i made this issue which can hopefully solve it
+  
+  
+  # bc_pa_filt %>%
+  #   # vect() %>%
+  #   rasterize(forests, field = "WDPAID", touches = T) %>%
+  #   writeRaster(here::here(input_loc, "bc_pa_wpdaid2.dat"),
+  #               filetype = "envi",
+  #               overwrite = T)
   
   write_sf(bc_pa_filt, pa_loc)
   rm(cad_pa, bc_pa, bc_terr_pa, bc_pa_filt)
@@ -108,7 +141,7 @@ bc_pa_filt <- vect(pa_loc)
 
 # bc bec zones dissolved
 bec_loc <- here::here(shp_loc, "bec_terr_agg.shp")
-
+bec_agg_loc <- here::here(shp_loc, "bec_agg.shp")
 
 if (!file.exists(bec_loc)) {
   bec <- bcmaps::bec() %>%
@@ -118,12 +151,22 @@ if (!file.exists(bec_loc)) {
                        by = "ZONE",
                        dissolve = T)
   
+  writeVector(bec_agg, bec_agg_loc, overwrite = T)
+  
   bec_terr <- intersect(bec_agg, bcb)
-  writeVector(bec_terr, bec_loc)
+  writeVector(bec_terr, bec_loc, overwrite = T)
   rm(bec, bec_agg)
 }
 
 bec_terr <- vect(bec_loc)
+
+bec_rst_loc <- here::here(input_loc, "bec.dat") 
+
+if(!file.exists(bec_rst_loc)) {
+  bec_agg <- vect(bec_agg_loc)
+  bec_rst <- rasterize(bec_agg, forests, field = "ZONE")
+  writeRaster(bec_rst, bec_rst_loc, filetype = "envi", overwrite = T)
+}
 
 # iter expand function
 iter_expand <- function(raster) {
@@ -292,8 +335,13 @@ struct_rasts <- map(struct_varnames, \(x) {
   if (!file.exists(sname)) {
     r <- rast(here::here(struct_locs, x, glue::glue("{x}_2015.dat")))
     masked <- r %>%
-      crop(y = forests, mask = T) %>%
-      writeRaster(., sname, filetype = "envi", overwrite = T)
+      crop(y = forests, mask = T)
+    
+    if(x == "elev_cv") {
+      masked[masked > 1000] = 1000
+    }
+    
+    writeRaster(masked, sname, filetype = "envi", overwrite = T)
   }
   rast(sname)
 }, .progress = "Structure Masking")

@@ -1,0 +1,689 @@
+---
+title: "Untitled"
+editor: visual
+---
+
+```{r}
+source(here::here("scripts", "0_setup.R"))
+library(rstatix)
+library(ggpubr)
+```
+
+```{r}
+custom_labeller <- as_labeller(c(
+  "all_intact" = "Structural + Functional",
+  "fun_intact" = "Functional",
+  "str_intact" = "Structural",
+  "area" = "Area (log(ha))",
+  "est_year" = "Year Established",
+  "road_dist" = "Distance to Nearest Road (km)",
+  "IUCN Category" = "IUCN Category"
+))
+
+
+match_lookup <- tibble(match_num = c(NA, 1, 2, 3, 4, 5),
+                       match_label = c(NA, "Perfect Match", "Suitable Match", "Matched Outside BEC Zone", "No Suitable Match", "Non Forest"))
+
+intact_lookup <- tibble(intact_num = c(NA, 1, 2, 3, 4),
+                        value = c(NA, "Low Pressure - High Integrity", "High Pressure - High Integrity", "Low Integrity", "Non Forest"))
+```
+
+```{r}
+# vrtr <- rast("E:/Sync/Masters/05_dissim_bc/data_backup/vrtr.dat")
+
+outputs_counts_all <- read_parquet("E:/Sync/Masters/05_dissim_bc/data/grouped_counts.parquet")
+
+outputs_counts <- outputs_counts_all %>%
+  filter(match_label != "Matched Outside BEC Zone")
+```
+
+```{r}
+# test
+
+tiles_plot <- here::here(rst_loc, "tiles_plot")
+vrtr <- list.files(tiles_plot, full.names = T, pattern = ".dat$") %>%
+  vrt()
+
+nms <- list.files(tiles_plot, full.names = T, pattern = ".dat$")[[1]] %>%
+  rast() %>%
+  names()
+
+names(vrtr) <- nms
+
+vlce_template <- rast("F:/mosaiced/VLCE2.0/LC_Class_terr_bc.dat")
+
+nf_rcl <- keys$vlce %>%
+  mutate(class_name = ifelse(forest == "Forest", NA, 1)) %>%
+  select(class_val, class_name) %>% 
+  as.matrix(ncol = 2)
+
+nf <- classify(vlce_template, nf_rcl) %>%
+  trim() %>%
+  extend(vrtr)
+
+levels(vrtr$match_num) <- match_lookup %>%
+  drop_na()
+
+levels(vrtr$str_intact) <- intact_lookup %>%
+  drop_na()
+
+levels(vrtr$fun_intact) <- intact_lookup %>%
+  drop_na()
+
+levels(vrtr$all_intact) <- intact_lookup %>%
+  drop_na()
+
+# plot(vrtr)
+```
+
+Assessment of matches
+
+```{r}
+# match_palette <- scico::scico(palette = "glasgow", categorical = T, n = 4)
+# match_palette_sorted = c(match_palette[3], match_palette[1], match_palette[2], match_palette[4])
+match_palette_sorted = c("#6a7536", "#351338", "#76a9b2", "#713004")
+# this is manually picked from
+# scico::scico(n = 24, palette = "glasgow") %>% scales::show_col(ncol = 6) 
+# leftmost column
+
+matches <- outputs_counts_all %>%
+  group_by(ZONE, match_label) %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n))
+
+# i like glasgow
+
+overall <- matches %>%
+  group_by(match_label) %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n)) %>%
+  mutate(ZONE = "BC Wide") 
+
+overall <- matches %>%
+  bind_rows(tibble(match_label = "Perfect Match", n = 111111111)) %>%
+  group_by(match_label) %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n)) %>%
+  mutate(ZONE = "BC Wide") 
+  
+  
+props <- bind_rows(overall, matches) %>%
+  mutate(faceting = ifelse(ZONE == "BC Wide", T, F)) %>%
+  ggplot(aes(y = ZONE, x = per, fill =  fct_rev(fct_relevel(
+      match_label,
+      "Perfect Match",
+      "Suitable Match",
+      "Matched Outside BEC Zone",
+      "No Suitable Match"
+    )))) +
+  geom_col(position = "stack") +
+  facet_grid(rows = vars(faceting), scales = "free", space = "free") +
+  scale_x_continuous(labels = scales::label_percent()) +
+  scale_fill_manual(values = rev(match_palette_sorted),
+                     guide = guide_legend(title = NULL, reverse = T)) +
+  theme(panel.spacing.y = unit(0, "lines"),
+          strip.text.y = element_blank(),
+        legend.position = "none") +
+  labs(x = NULL,
+       y = NULL) +
+  plot_layout(guides = "keep")
+
+
+match_r <- vrtr$match_num
+
+x_mask <- mask(match_r, nf, maskvalue = 1, updatevalue = 5)
+
+levels(x_mask) <- match_lookup %>%
+  drop_na()
+
+map <- ggplot() +
+  geom_spatraster(data = match_r, maxcell = 10e+06) +
+  # geom_spatvector(data = bcmaps::bc_bound_hres() %>% vect(), fill = "#00000000") +
+  scale_fill_manual(
+    values = c(match_palette_sorted),
+    na.translate = F
+  ) +
+  theme_void() +
+  labs(fill = NULL) +
+  theme(legend.position = "bottom") +
+  plot_layout(guides = "collect")
+
+
+mp <- map + props +
+  plot_layout(widths = c(2, 1)) +
+  plot_annotation(tag_levels = "A")
+
+ggsave(here::here(fig_loc, "matching.png"), mp, height = 6, width = 10, dpi = 300)
+```
+
+Intactness and maps
+
+```{r}
+
+
+# change here to add in comb_all_itnact
+iter <- names(vrtr[[2:4]])
+
+map_pies <- map(iter, \(x) {
+  
+  x <- vrtr %>%
+    subset(x)
+  
+  x_mask <- mask(x, nf, maskvalue = 1, updatevalue = 4)
+  
+  levels(x_mask) <- intact_lookup %>%
+    drop_na()
+  
+  map <- ggplot() +
+    geom_spatraster(data = x_mask, maxcell = 10e+06) +
+    scale_fill_manual(values = c("#2e7d32", "#a2ab58", "#D95F02", "grey"), na.translate = F) +
+    theme_void() +
+    labs(fill = "compared to reference state") +
+    theme(legend.position = "bottom",
+          legend.title.position = "bottom",
+          legend.title = element_text(hjust = 0.5, size = 10))
+  
+  return(list(map = map, pie = pie))
+  
+  # map_pie <- map + inset_element(pie, left = 0.65, right = .95,
+  #                     bottom = 0.65, top = .95)
+  # 
+  # ggsave("test.png", map_pie, height = 6, width = 6)
+}, .progress = T)
+
+# palette from here
+# https://d3js.org/d3-scale-chromatic/categorical
+# schemeCategory10
+
+pressure_intact <- outputs_counts %>%
+  select(ZONE, pressure, ends_with("intact"), n) %>%
+  group_by(across(-n)) %>%
+  summarize(n = sum(n)) 
+# this drop_na just removes edge pixels from the bec raster
+
+pi_per <- pressure_intact %>%
+  mutate(all_intact = ifelse(str_intact == "Intact" & fun_intact == "Intact", "Intact", "Degraded")) %>%
+  pivot_longer(ends_with("intact")) %>%
+  mutate(value = ifelse(value == "Intact", "High Integrity", "Low Integrity")) %>%
+  mutate(col_label = ifelse(value == "Low Integrity", "Low Integrity", glue::glue("{pressure} Pressure - {value}"))) %>%
+  group_by(ZONE, name) %>%
+  mutate(per = n / sum(n))
+
+bec_props <- map(iter, \(x) {
+  pi_class <- pi_per %>%
+    filter(name == x) 
+  
+  overall <- pi_class %>% 
+    group_by(name, col_label) %>% 
+    summarize(n = sum(n)) %>% 
+    mutate(per = n / sum(n)) %>%
+    mutate(ZONE = "BC Wide",
+           facet2 = "All")
+  
+  
+  pi_class %>%
+    mutate(facet2 = "Zonal") %>%
+    bind_rows(overall) %>%
+    ggplot(aes(y = fct_rev(ZONE), x = per, fill = fct_relevel(col_label,
+                                "Low Integrity",
+                                "High Pressure - High Integrity",
+                                "Low Pressure - High Integrity"))) +
+    geom_col() +
+    facet_grid(rows = vars(fct_rev(facet2)), cols = vars(name), labeller = custom_labeller,
+               space = "free",
+               scales = "free") +
+    scale_fill_manual(values = c("#D95F02", "#a2ab58", "#2e7d32"),
+                      guide = "none") +
+    labs(fill = NULL, x = NULL, y = NULL) +
+    scale_x_continuous(labels = scales::label_percent()) +
+    theme(panel.spacing.y = unit(0, "lines"),
+          strip.text.y = element_blank())
+})
+
+pies <- map(map_pies, "pie")
+maps <- map(map_pies, "map")
+
+mps <- map2(maps, pies, \(map, pie) {
+  map_pie <- map + inset_element(pie, left = 0.65, right = .95,
+                       bottom = 0.65, top = .95)
+})
+
+layout <- "
+ABC
+DEF
+"
+
+all <- (bec_props[[1]] + labs(title = "A") + plot_layout(guides = "keep")+ 
+          bec_props[[2]] + plot_layout(guides = "keep") +
+          bec_props[[3]] + plot_layout(guides = "keep") + 
+    maps[[1]] + labs(title = "B") + plot_layout(guides = "collect") + 
+      maps[[2]] + plot_layout(guides = "collect") + 
+      maps[[3]] + plot_layout(guides = "collect")) + 
+    plot_layout(design = layout, axes = "collect")
+
+ggsave(here::here(fig_loc, "prop_degraded.png"), all, height = 6, width = 10, dpi = 600)
+
+```
+
+```{r}
+hf_counts <- outputs_counts %>%
+  group_by(footprint_class, 
+           pressure,
+           str_intact, 
+           fun_intact, 
+           all_intact) %>%
+  summarize(n = sum(n)) %>%
+  pivot_longer(cols = ends_with("intact")) %>%
+  group_by(footprint_class, pressure, name, value) %>%
+  summarize(n = sum(n)) %>%
+  drop_na() %>%
+  mutate(value = ifelse(value == "Intact", "High Integrity", "Low Integrity")) %>%
+  mutate(fill_label = ifelse(str_detect(value, "High Integrity"), 
+                             glue::glue("{pressure} Pressure - {value}"),
+                             value)) %>%
+  mutate(ha = (n * 30 * 30) / 10000,
+         mha = ha / 1000000,
+         per = n / sum(n))
+
+
+hf_area_plot <- hf_counts %>% 
+  ggplot(aes(x = fct_relevel(footprint_class, 
+                             "No Pressure", 
+                             "Low Pressure", 
+                             "Medium Pressure", 
+                             "High Pressure"), 
+             y = mha,
+             fill = fill_label)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c("#D95F02", "#a2ab58", "#2e7d32")) +
+  facet_wrap(~fct_rev(name), labeller = custom_labeller) +
+  labs(x = NULL,
+       y = "Area (million ha)",
+       fill = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+hf_per_plot <- hf_counts %>% 
+  ggplot(aes(x = fct_relevel(footprint_class, 
+                             "No Pressure", 
+                             "Low Pressure", 
+                             "Medium Pressure", 
+                             "High Pressure"), 
+             y = per,
+             fill = fill_label)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c("#D95F02", "#a2ab58", "#2e7d32")) +
+  facet_wrap(~fct_rev(name), labeller = custom_labeller) +
+  labs(x = NULL,
+       y = "Percent of Forests",
+       fill = NULL) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(labels = scales::label_percent())
+
+ggsave(here::here(fig_loc, "area_hf.png"), hf_area_plot, height = 6, width = 6)
+
+hf_per_plot <- hf_counts %>% 
+  ggplot(aes(x = fct_relevel(footprint_class, 
+                             "No Pressure", 
+                             "Low Pressure", 
+                             "Medium Pressure", 
+                             "High Pressure") %>%
+               fct_rev(), 
+             y = per,
+             fill = fct_relevel(fill_label,
+                                "Low Integrity",
+                                "High Pressure - High Integrity",
+                                "Low Pressure - High Integrity"))) +
+  geom_col(position = "stack") +
+  scale_fill_manual(values = c("#D95F02", "#a2ab58", "#2e7d32")) +
+  facet_wrap(~fct_rev(name), labeller = custom_labeller) +
+  labs(x = NULL,
+       y = "Percent of Forests",
+       fill = "compared to reference state") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.title.position = "bottom",
+        legend.title = element_text(hjust = 0.5, size = 10)) +
+  scale_y_continuous(labels = scales::label_percent())
+
+hf_per_plot +
+  coord_flip()
+
+ggsave(here::here(fig_loc, "per_hf.png"), hf_per_plot, height = 6, width = 6)
+  
+egg <- hf_counts %>% 
+  filter(name == "all_intact") %>% 
+  group_by(footprint_class) %>% 
+  summarize(mha = sum(mha)) %>% 
+  mutate(faceit = "Area") %>%
+  ggplot(aes(x = fct_relevel(footprint_class, 
+                             "No Pressure", 
+                             "Low Pressure", 
+                             "Medium Pressure", 
+                             "High Pressure") %>%
+               fct_rev(), y =  mha)) + 
+  geom_col() +
+  coord_flip() +
+  labs(x = NULL,
+       y = "Area (million ha)") +
+  facet_wrap(~faceit)
+
+hf_per_area <- hf_per_plot + coord_flip() + egg +
+  plot_layout(widths = c(3, 1), axes = "collect", axis = "collect")
+
+ggsave(here::here(fig_loc, "hf_per_area.png"), hf_per_area, height = 6, width = 10)
+```
+
+Compare proportion intact by if the area is protected or not, removing treatment pixels
+
+```{r}
+custom_labeller2 <- as_labeller(c(
+  "all" = "Structural + Functional",
+  "fun" = "Functional",
+  "str" = "Structural"
+))
+
+prop_pro_unpro <- outputs_counts %>%
+  filter(!treatment,
+         disturbance == 0) %>%
+  group_by(prot = !is.na(WDPAID), 
+           footprint_class, 
+           str_intact, 
+           fun_intact, 
+           all_intact) %>%
+  summarize(n = sum(n)) %>%
+  pivot_longer(ends_with("intact")) %>%
+  group_by(prot, footprint_class, name, value) %>%
+  drop_na() %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n)) %>%
+  filter(value == "Intact") %>%
+  ggplot(aes(x = fct_relevel(footprint_class, 
+                             "No Pressure", 
+                             "Low Pressure", 
+                             "Medium Pressure", 
+                             "High Pressure"), 
+             y = per)) +
+  geom_col(aes(fill = fct_rev(as.factor(prot))), position = "dodge") +
+  labs(x = "Human Footprint Class", 
+       y = "Proportion of High Integrity Forests",
+       fill = NULL) +
+  scale_y_continuous(labels = scales::label_percent(), limits = c(0, 1), expand = c(0, 0)) +
+  facet_wrap(~fct_rev(name), labeller = custom_labeller) +
+  scale_fill_manual(labels = c("Protected", "Unprotected"), values = c("#003366", "#E3C16F")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave(here::here(fig_loc, "prop_pro_unpro.png"), prop_pro_unpro, dpi = 300, height = 4, width = 6)
+  
+```
+
+Disturbance assessment
+
+```{r}
+outputs_counts %>%
+  group_by(disturbance, str = str_detect(str_intact, "Intact"), 
+           fun = str_detect(fun_intact, "Intact"), 
+           all = str_detect(all_intact, "Intact")) %>%
+  summarize(n = sum(n)) %>%
+  drop_na() %>%
+  pivot_longer(str:all) %>%
+  group_by(disturbance, name, value) %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n)) %>%
+  #filter(value) %>%
+  left_join(keys$disturbance, by = c("disturbance" = "class_val")) %>%
+  filter(class %in% c("Undisturbed", "Fire", "Harvesting", "Non Stand-Replacing")) %>%
+  ggplot(aes(x = class, y = per, fill = value)) +
+  geom_col(position = "stack") +
+  facet_wrap(~name, labeller = custom_labeller2) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(y = "Proportion") +
+  coord_flip()
+
+outputs_counts %>%
+  group_by(disturbance, pressure, str_intact, fun_intact, all_intact) %>%
+  summarize(n = sum(n)) %>%
+  drop_na() %>%
+  pivot_longer(ends_with("intact")) %>%
+  mutate(fill_label = ifelse(str_detect(value, "Intact"), glue::glue("{pressure} Pressure - {value}"), value)) %>%
+  group_by(name, disturbance, fill_label) %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n)) %>%
+  #filter(value) %>%
+  left_join(keys$disturbance, by = c("disturbance" = "class_val")) %>%
+  filter(class %in% c("Undisturbed", "Fire", "Harvesting", "Non Stand-Replacing")) %>%
+  ggplot(aes(x = class, y = per, fill = fill_label)) +
+  geom_col(position = "stack") +
+  facet_wrap(~fct_rev(name), labeller = custom_labeller) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(y = "Proportion",
+       x = NULL,
+       fill = NULL) +
+  coord_flip() +
+  scale_fill_manual(values = c("#D95F02", "#a2ab58", "#2e7d32"))
+
+ggsave(here::here(fig_loc, "all_dist.png"), height = 6, width = 6)
+```
+
+disturbance by bec zone
+
+```{r}
+outputs_counts %>%
+  group_by(ZONE, disturbance, pressure, str_intact, fun_intact, all_intact) %>%
+  summarize(n = sum(n)) %>%
+  drop_na() %>%
+  pivot_longer(ends_with("intact")) %>%
+  mutate(fill_label = ifelse(str_detect(value, "Intact"), glue::glue("{pressure} Pressure - {value}"), value)) %>%
+  group_by(ZONE, name, disturbance, fill_label) %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n)) %>%
+  #filter(value) %>%
+  left_join(keys$disturbance, by = c("disturbance" = "class_val")) %>%
+  filter(class %in% c("Undisturbed", "Fire", "Harvesting", "Non Stand-Replacing")) %>%
+  ggplot(aes(x = class, y = per, fill = fill_label)) +
+  geom_col(position = "stack") +
+  facet_grid(rows = vars(name), cols = vars(ZONE)) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  labs(y = "Proportion",
+       x = NULL,
+       fill = NULL) +
+  coord_flip() +
+  scale_fill_manual(values = c("#D95F02", "#a2ab58", "#2e7d32"))
+
+ggsave(here::here(fig_loc, "huge.png"), height = 9, width = 32)
+
+```
+
+greatest_change_year
+
+```{r}
+gcy_labeller <- as_labeller(c(
+  "all_intact" = "Structural + Functional",
+  "fun_intact" = "Functional",
+  "str_intact" = "Structural",
+  "Fire" = "Fire",
+  "Harvesting" = "Harvesting",
+  "Non Stand-Replacing" = "Non Stand-Replacing"
+))
+
+gcy_dist <- outputs_counts  %>%
+  group_by(gcy, disturbance, pressure, str_intact, fun_intact, all_intact) %>%
+  summarize(n = sum(n)) %>%
+  drop_na() %>%
+  pivot_longer(ends_with("intact")) %>%
+  mutate(value = ifelse(value == "Intact", "High Integrity", "Low Integrity")) %>%
+  mutate(fill_label = ifelse(str_detect(value, "High Integrity"), 
+                             glue::glue("{pressure} Pressure - {value}"),
+                             value)) %>%
+  group_by(gcy, name, disturbance, fill_label) %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n)) %>%
+  #filter(value) %>%
+  left_join(keys$disturbance, by = c("disturbance" = "class_val")) %>%
+  filter(class %in% c("Undisturbed", "Fire", "Harvesting", "Non Stand-Replacing")) %>%
+  filter(gcy != 0) %>%
+  mutate(tsd = gcy - 2015)
+
+gcy_dist %>%
+  ggplot(aes(x = tsd * -1, y = per, fill = fct_relevel(fill_label,
+                                "Low Integrity",
+                                "High Pressure - High Integrity",
+                                "Low Pressure - High Integrity"))) +
+  geom_col(position = "stack", width = 1) +
+  geom_vline(xintercept = 0, col = "black", lty = "dashed") +
+  facet_grid(rows = vars(class), cols = vars(fct_rev(name)), labeller = gcy_labeller) +
+  scale_fill_manual(values = c("#D95F02", "#a2ab58", "#2e7d32")) +
+  scale_y_continuous(labels = scales::label_percent(), expand = c(0, 0)) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Time Since Disturbance (years)",
+       y = "Proportion",
+       fill = "compared to reference state") +
+  theme(panel.spacing.y = unit(0.025, "npc"),
+        legend.title.position = "bottom",
+        legend.title = element_text(hjust = 0.5, size = 10))
+
+ggsave(here::here(fig_loc, "tsd.png"), height = 6, width = 6)
+```
+
+protected areas
+
+```{r}
+bc_pa <- here::here(shp_loc, "bc_pa.gpkg") %>%
+  vect()
+
+bc_pa_filt <- bc_pa %>%
+  mutate(area = expanse(., unit = "ha") %>%
+           as.numeric() %>%
+           round(digits = 2)) %>%
+  filter(IUCN_CAT %in% c("Ia", "Ib", "II", "IV")) %>%
+  filter(area > 100) 
+
+big_roads <- bcdata::bcdc_query_geodata('d6245676-b6d5-4747-8cb0-757cb138cbdf') %>%
+    collect() %>%
+    vect()
+
+distances <- distance(bc_pa_filt, big_roads)
+```
+
+```{r}
+
+pa_join = bc_pa_filt %>%
+  as_tibble() %>%
+  mutate(road_dist = distances) %>%
+  group_by(WDPAID, IUCN_CAT) %>%
+  summarize(area = sum(area),
+            road_dist = min(road_dist) / 1000,
+            est_year = min(STATUS_YR))
+
+
+pa_joined <- outputs_counts %>% 
+  filter(!treatment) %>%
+  drop_na(WDPAID) %>%
+  group_by(WDPAID, str_intact, fun_intact, all_intact) %>% 
+  summarize(n = sum(n)) %>%
+  pivot_longer(ends_with("intact")) %>%
+  group_by(WDPAID, name, value) %>%
+  summarize(n = sum(n)) %>%
+  mutate(per = n / sum(n)) %>%
+  left_join(pa_join, by = c("WDPAID" = "WDPAID")) %>%
+  filter(value == "Intact") 
+
+anova <- pa_joined %>%
+  group_by(name) %>%
+  group_split() %>%
+  map_dfr(\(x) {
+    md <- x %>%
+      pull(name) %>%
+      unique()
+    
+    aov(per ~ IUCN_CAT, data = x) %>%
+      broom::tidy() %>%
+      mutate(name = md) %>%
+      filter(term == "IUCN_CAT")
+  })  %>%
+  mutate(p.adj = p.adjust(p.value, method = "holm")) %>%
+  arrange(p.adj) %>%
+  mutate(col_lab = "IUCN Category") %>%
+  mutate(label = ifelse(p.adj < 0.05, "ANOVA: p < 0.05", "ANOVA: P > 0.05"))
+
+sig_metric <- anova %>%
+  filter(p.adj < 0.05) %>%
+  pull(name)
+
+tukey <- pa_joined %>%
+  group_by(name) %>%
+  group_split() %>%
+  map_dfr(\(x) {
+    md <- x %>%
+      pull(name) %>%
+      unique()
+    x %>%
+      mutate(IUCN_CAT = as.factor(IUCN_CAT)) %>%
+      rstatix::tukey_hsd(per ~ IUCN_CAT) %>%
+      add_xy_position() %>%
+      mutate(name = md)
+  }) %>%
+  filter(name %in% sig_metric,
+         p.adj.signif != "ns")
+
+box <- pa_joined %>%
+  mutate(col_lab = "IUCN Category") %>%
+  ggplot() +
+  geom_boxplot(aes(x = IUCN_CAT, y = per, fill = IUCN_CAT), outlier.alpha = 0.5) +
+  facet_grid(rows = vars(name),
+             cols = vars(col_lab),
+             labeller = custom_labeller) +
+  scico::scale_fill_scico_d() +
+  labs(x = NULL,
+       y = NULL) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.position = "none") +
+  plot_layout(guides = "keep") +
+  geom_text(data = anova, aes(x = "Ia", y = 0, label = label), hjust = -0.5) +
+  stat_pvalue_manual(tukey %>%
+                       mutate(y.position = y.position - 1), label = "p.adj.signif") +
+  scale_y_continuous(limits = c(0, 1))
+
+r2 <- pa_joined %>% 
+  mutate(area = log(area)) %>%
+  pivot_longer(area:est_year, names_to = "names_x", values_to = "values_x") %>%
+  group_by(names_x, name) %>%
+  # group_split()
+  summarise(
+    r_squared = summary(lm(per ~ values_x))$r.squared %>%
+      round(3),
+    .groups = 'drop'
+  ) %>%
+  mutate(lab = glue::glue("R^2: {r_squared}"))
+
+
+
+dot <- pa_joined %>% 
+  mutate(area = log(area)) %>%
+  pivot_longer(area:est_year, names_to = "names_x", values_to = "values_x") %>% 
+  ggplot(aes(x = values_x, y = per)) +
+  geom_point(aes(col = IUCN_CAT), alpha = 0.5) +
+  geom_smooth(method = "lm", lty = "dashed", col = "red") +
+  scico::scale_colour_scico_d() +
+  facet_grid(rows = vars(name),
+             cols = vars(names_x),
+             scales = "free_x",
+             labeller = custom_labeller) +
+  scale_y_continuous(label = scales::label_percent()) +
+  theme(strip.text.y = element_blank(),
+        panel.spacing.x = unit(1, "lines")) +
+  labs(x = NULL,
+       colour = "IUCN Category",
+       y = "Proportion < 2σ") +
+  plot_layout(guides = "collect") +
+  geom_text(data = r2, aes(x = Inf, y = Inf, label = lab),
+            parse = T,
+            hjust = 1,
+            vjust = 1)
+
+layout <- "AAAB"
+
+dot + box + plot_layout(design = layout, axes = "collect")
+
+ggsave(here::here(fig_loc, "dot_box.png"), height = 8, width = 12, dpi = 300)
+
+```

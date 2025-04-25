@@ -74,12 +74,10 @@ for group, model in ipca_models.items():
         combined_data = np.vstack(data_buffer[group])
         if buffer_has_enough_data(combined_data, min_data_points):
             model.partial_fit(combined_data)
-        else:
-            print("GET ABSOLUTELY REKT, have fun figuring this out") 
 
 # Save transformed data for each chunk (updated with PCA components and logic for merging)
 for tile_file in files_iter:
-    if tile_file.endswith('.tif'):
+    if tile_file.endswith('.dat'):
         tile_path = os.path.join(tiles_folder, tile_file)
         print(tile_path)
 

@@ -1,0 +1,57 @@
+---
+title: "gcy"
+editor: visual
+---
+
+```{r}
+source(here::here("scripts", "0_setup.R"))
+
+layer <- here::here(input_loc, "bc_pa_wpdaid.dat") %>%
+  rast()
+
+name = "WDPAID"
+
+subfolder_name <- glue::glue("tiles_{name}")
+
+r_tile <- here::here(rst_loc, subfolder_name)
+dir.create(r_tile)
+
+pq_tile <- here::here(pq_loc, subfolder_name)
+dir.create(pq_tile)
+
+rst_tiles <- makeTiles(
+    layer,
+    y = 1000,
+    filename = here::here(r_tile, "tile_.dat"),
+    filetype = "envi",
+    datatype = "FLT8S"
+  )
+```
+
+```{r}
+
+rst_tiles %>%
+  map(\(x) {
+    filename <- x %>%
+      basename() %>%
+      tools::file_path_sans_ext() %>%
+      glue::glue(".parquet")
+    
+    savename <- here::here(pq_tile, filename)
+    
+    if(file.exists(savename)) {return(savename)}
+    
+    r <- rast(x)
+    
+    names(r) <- name
+    
+    as_tibble(r, xy = T) %>%
+      write_parquet(savename)
+    
+    savename
+  }, .progress = list(total = length(rst_tiles) %>% as.numeric(), format = "{cli::pb_spin} Processing {cli::pb_current}/{cli::pb_total} | {cli::pb_eta_str}"))
+```
+
+```{r}
+
+```

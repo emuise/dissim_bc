@@ -1,0 +1,204 @@
+---
+title: "Untitled"
+editor: visual
+---
+
+```{r}
+source(here::here("scripts", "0_setup.R"))
+```
+
+```{r}
+sigma <- here::here(pq_loc, "sigma_tiles") %>%
+  list.files(full.names = T)
+
+base <- here::here(pq_loc, "tiles") %>%
+  list.files(full.names = T)
+
+bnos <- as.numeric(gsub(".*tile_(\\d+)", "\\1", base) %>%
+                     tools::file_path_sans_ext())
+
+base <- base[order(bnos)]
+```
+
+```{r}
+
+match_lookup <- tibble(match_num = c(NA, 1, 2, 3, 4, 5),
+                       match_label = c(NA, "Perfect Match", "Suitable Match", "Matched Outside BEC Zone", "No Suitable Match", "Non Forest"))
+
+intact_lookup <- tibble(intact_num = c(NA, 1, 2, 3, 4),
+                        value = c(NA, "Low Pressure - Intact", "High Pressure - Intact", "Degraded", "Non Forest"))
+
+tiles_plot <- here::here(rst_loc, "tiles_plot")
+dir.create(tiles_plot, showWarnings = T)
+
+tiles_plot_pq <- here::here(pq_loc, "tiles_plot")
+dir.create(tiles_plot_pq, showWarnings = T)
+
+basetile_loc <- here::here(rst_loc, "tiles")
+
+x <- base[[23]]
+outputs <- map(
+  base,
+  \(x) {
+    tilename <- x %>%
+      basename() %>%
+      tools::file_path_sans_ext()
+    
+    savename_r <- here::here(tiles_plot, tilename %>%
+                               glue::glue(".dat"))
+    savename_pq <- here::here(tiles_plot_pq, tilename %>%
+                                glue::glue(".parquet"))
+    
+    if (all(file.exists(savename_r, savename_pq))) {
+      return(savename_pq)
+    }
+    
+    bas <- open_dataset(x)
+    sig <- x %>%
+      str_replace("tiles", "sigma_tiles") %>%
+      tools::file_path_sans_ext() %>%
+      open_dataset()
+    pa <- x %>%
+      str_replace("tiles", "tiles_WDPAID") %>%
+      open_dataset()
+    
+    working <- left_join(bas, sig) %>%
+      left_join(pa) %>%
+      mutate(suitable_match = nn_dist < 2) %>%
+      mutate(
+        pressure = ifelse(bc_albers_footprint <= 4, "Low", "High"),
+        all_intact = ifelse(sigma_all <= 2, "Intact", "Degraded"),
+        str_intact = ifelse(sigma_str <= 2, "Intact", "Degraded"),
+        fun_intact = ifelse(sigma_fun <= 2, "Intact", "Degraded")#,
+        # str_intact = ifelse(disturbance == 0, str_intact, "Degraded"),
+        # fun_intact = ifelse(disturbance == 0, fun_intact, "Degraded")
+      ) %>%
+      mutate(
+        match_label = case_when(
+          matched_bec == 0 ~ "Matched Outside BEC Zone",
+          nn_dist == 0 ~ "Perfect Match",
+          suitable_match == F ~ "No Suitable Match",
+          suitable_match == T ~ "Suitable Match"
+        )
+      ) %>%
+      mutate(
+        footprint_class = case_when(
+          bc_albers_footprint  == 0 ~ "No Pressure",
+          bc_albers_footprint  > 0 &
+            bc_albers_footprint  <= 4 ~ "Low Pressure",
+          bc_albers_footprint  > 4 &
+            bc_albers_footprint  <= 8 ~ "Medium Pressure",
+          bc_albers_footprint  > 8 ~ "High Pressure"
+        )
+      )
+    
+    
+    if (!file.exists(savename_pq)) {
+      working_counts <- working %>%
+        count(
+          footprint_class,
+          WDPAID,
+          disturbance,
+          gcy,
+          forests,
+          strata,
+          ZONE,
+          treatment,
+          matched_bec,
+          suitable_match,
+          pressure,
+          str_intact,
+          fun_intact,
+          all_intact,
+          match_label
+        )
+      
+      write_parquet(working_counts, savename_pq)
+    }
+    
+    if (file.exists(savename_r)) {
+      return(savename_pq)
+    }
+    
+    
+    template <- here::here(basetile_loc, tilename %>%
+                             glue::glue(".dat")) %>%
+      rast()
+    
+    template_df <- template %>%
+      as.data.frame(xy = T) %>%
+      select(x, y)
+    
+    w <- working %>%
+      collect() %>%
+      mutate(
+        str_intact = ifelse(
+          str_intact == "Degraded",
+          "Degraded",
+          glue::glue("{pressure} Pressure - {str_intact}")
+        ),
+        
+        fun_intact = ifelse(
+          fun_intact == "Degraded",
+          "Degraded",
+          glue::glue("{pressure} Pressure - {fun_intact}")
+        ),
+        all_intact = ifelse(
+          all_intact == "Degraded",
+          "Degraded",
+          glue::glue("{pressure} Pressure - {all_intact}")
+        )
+        ) %>%
+      select(x, y, str_intact, fun_intact, all_intact, match_label)
+    
+    joined <- left_join(template_df, w, by = c("x", "y")) %>%
+      as_tibble() %>%
+      left_join(match_lookup, by = "match_label") %>%
+      pivot_longer(ends_with("intact")) %>%
+      left_join(intact_lookup, by = "value") %>%
+      select(x, y, match_num, name, intact_num) %>%
+      pivot_wider(names_from = name, values_from = intact_num)
+    
+    r <- joined %>%
+      rast(crs = "epsg:3005", extent = template) 
+    
+    r %>%
+      writeRaster(filename = savename_r, filetype = "envi")
+    
+    return(savename_pq)
+    
+    
+  },
+  .progress = list(total = length(base) %>% as.numeric(), format = "{cli::pb_spin} Processing {cli::pb_current}/{cli::pb_total} | {cli::pb_eta_str}")
+)
+
+outputs_counts <- outputs %>%
+  unlist() %>%
+  open_dataset() %>%
+  mutate(gcy = ifelse(disturbance == 0, 0, gcy),
+         disturbance = ifelse(gcy == 0, 0, disturbance)) %>%
+  group_by(
+    footprint_class,
+    WDPAID,
+    disturbance,
+    gcy,
+    forests,
+    strata,
+    ZONE,
+    treatment,
+    matched_bec,
+    suitable_match,
+    pressure,
+    str_intact,
+    fun_intact,
+    all_intact,
+    match_label
+  ) %>%
+  summarize(n = sum(n)) %>%
+  collect() %>%
+  drop_na(ZONE, forests, footprint_class, disturbance, matched_bec, fun_intact) %>%
+  ungroup() 
+  # removes missing BEC zones at edges, not a missing data problem
+
+write_parquet(outputs_counts, here::here("data", "grouped_counts.parquet"))
+```

@@ -1,0 +1,840 @@
+---
+title: "analysis"
+editor: visual
+---
+
+# setup -
+
+packages and folders, adjust this script as needed and run at the start of all qmds
+
+```{r}
+source(here::here("scripts", "0_setup.R"))
+
+theme_set(theme_bw() +
+            theme(panel.grid = element_blank()))
+```
+
+# generate covariate quantiles
+
+```{r}
+# run if any data inputs are missing
+# it doesn't fully check if everything is done so like
+# source(here::here("scripts", "0_get_data.R"))
+
+quantile_loc <- here::here(data_loc, "quantiles.csv")
+
+if (!file.exists(quantile_loc)) {
+  use_python("C:/Users/evanmuis/AppData/Local/miniconda3/envs/geo/python.exe")
+  
+  source_python(here::here("scripts", "0a_get_quantiles.py"))
+}
+
+quantile_df <- read_csv(quantile_loc) %>%
+  pivot_wider(names_from = quantile, values_from = value) %>%
+  mutate(`0` = `0` - 1e-6,
+         `1` = `1` + 1e-6)
+
+cov_names <- quantile_df %>%
+  pull(variable)
+```
+
+# load all data
+
+```{r}
+files <- list.files(input_loc, pattern = ".dat$")
+
+nms <- tools::file_path_sans_ext(files)
+
+all <- rast(here::here(input_loc, files))
+
+names(all) <- nms
+
+n_tiles_goal <- ceiling(nrow(all) / 1000) * ceiling(ncol(all) / 1000)
+
+bec_tab <- levels(all$bec) %>%
+  .[[1]] %>%
+  as_tibble()
+```
+
+# chunk all_all and save to files
+
+```{r}
+attrs <- c("percentage_first_returns_above_2m",
+           "total_biomass",
+           "elev_cv",
+           "elev_p95",
+           "CumDHI",
+           "VarDHI")
+
+tile_loc <- here::here(rst_loc, "tiles")
+dir.create(tile_loc, showWarnings = F)
+
+base_tiles <- list.files(tile_loc, pattern = ".dat$", full.names = T)
+
+if (!(length(base_tiles) == n_tiles_goal)) {
+  # turn covariates into bins
+  binned <- map(cov_names, \(x) {
+    print(x)
+    rcl <- quantile_df %>%
+      filter(variable == x) %>%
+      select(-variable) %>%
+      as.numeric()
+    
+    all %>%
+      select(all_of(x)) %>%
+      classify(rcl) %>%
+      as.numeric()
+  }, .progress = "reclassifying bins") %>%
+    rast()
+  
+  names(binned) <- glue::glue("{names(binned)}_bin")
+  
+  # normalize structure and fucntion variables pre pca
+  
+  normed <- map(attrs, \(x) {
+    print(x)
+    
+    all %>%
+      select(all_of(x)) %>%
+      scale()
+  }) %>%
+    rast()
+  
+  names(normed) <- glue::glue("{varnames(normed)}_scaled")
+  
+  all_all <- c(all, binned, normed)
+  rm(all, binned, normed)
+  
+  print("making tiles")
+  makeTiles(
+    all_all,
+    y = 1000,
+    filename = here::here(tile_loc, "tile_.dat"),
+    filetype = "envi"
+  )
+  
+}
+
+base_tiles <- list.files(tile_loc, pattern = ".dat$", full.names = T)
+
+# sort base tiles so i can tell how far in we are
+tilenos <- as.numeric(gsub(".*tile_(\\d+)\\.dat", "\\1", base_tiles))
+
+base_tiles <- base_tiles[order(tilenos)]
+```
+
+# run incremental PCA in python
+
+```{r}
+tile_pca_loc <- here::here(rst_loc, "tiles_pca")
+
+pca_tiles <- list.files(tile_pca_loc, pattern = ".dat$", full.names = T)
+
+if(!(length(base_tiles) * 3 == length(pca_tiles))) {
+  source_python(here::here("scripts", "0a_ipca.py"))
+}
+
+pca_tiles <- list.files(tile_pca_loc, pattern = ".dat$", full.names = T)
+```
+
+# get global standard deviations
+
+```{r}
+pca_sd_loc <- here::here(data_loc, "pc_sd.csv")
+
+if (!file.exists(pca_sd_loc)) {
+  vrt_all <- pca_tiles %>%
+    str_subset("all.dat$") %>%
+    vrt()
+  
+  vrt_str <- pca_tiles %>%
+    str_subset("ure.dat$") %>%
+    vrt()
+  
+  vrt_fun <- pca_tiles %>%
+    str_subset("ion.dat$") %>%
+    vrt()
+  
+  
+  vrtd <- c(vrt_all, vrt_str, vrt_fun)
+  
+  global_sds <- global(vrtd, fun = "sd")
+  
+  sd_df <- global_sds %>%
+    as_tibble() %>%
+    mutate(
+      pc = c(
+        "all_1",
+        "all_2",
+        "all_3",
+        "all_4",
+        "all_5",
+        "all_6",
+        "structure_1",
+        "structure_2",
+        "structure_3",
+        "structure_4",
+        "function_1",
+        "function_2"
+      )
+    ) %>%
+    pivot_wider(names_from = pc, values_from = sd)
+  
+  write_csv(sd_df, pca_sd_loc)
+}
+
+# table with global standard deviations
+glob_sds <- read_csv(pca_sd_loc)
+
+# table with number of valid principle component axes
+df_tab <- glob_sds %>% 
+  pivot_longer(everything()) %>% 
+  separate(name, into = c("name", "no")) %>% 
+  count(name) %>% 
+  mutate(name = str_sub(name, 1, 3)) %>%
+  pivot_wider(names_from = name, values_from = n)
+```
+
+# split out files into BEC, forest type, strata folders
+
+```{r}
+pca_names <- c("all", "structure", "function")
+
+pq_tile_loc <- here::here(pq_loc, "tiles")
+dir.create(pq_tile_loc, showWarnings = F)
+
+# make folder structure in splits
+split_loc <- here::here(pq_loc, "splits")
+dir.create(split_loc, showWarnings = F)
+
+zones <- bec_tab$ZONE
+
+ftypes <- keys$vlce %>%
+  filter(forest == "Forest") %>%
+  pull(class_name)
+
+crossing(zones, ftypes) %>%
+  mutate(dir = here::here(split_loc, zones, ftypes)) %>%
+  pull(dir) %>%
+  map(dir.create, recursive = T, showWarnings = F)
+
+bsft_count_loc <- here::here(data_loc, "bsft_counts.parquet")
+
+if (!file.exists(bsft_count_loc)) {
+  bsft_counts <- map_dfr(base_tiles, \(x) {
+    tilename <- x %>%
+      basename() %>%
+      tools::file_path_sans_ext()
+    
+    tile_sname <- here::here(pq_tile_loc, glue::glue("{tilename}.parquet"))
+    
+    #print(tilename)
+    
+    if (file.exists(tile_sname)) {
+      #message("File Exists")
+      out <- open_dataset(tile_sname) %>%
+        count(ZONE, strata, forests, treatment) %>%
+        collect()
+      
+      return(out)
+    }
+    
+    r <- rast(x)
+    
+    mask <- r$forests
+    
+    nas <- global(mask, fun = "anynotNA") %>%
+      all()
+    
+    if (!nas) {
+      #message("No Forested Pixels")
+      return()
+    }
+    
+    pca_r <- basename(x) %>%
+      here::here(tile_pca_loc, .) %>%
+      str_replace("\\.dat", glue::glue("_{pca_names}.dat")) %>%
+      rast()
+    
+    names(pca_r) <- str_remove(names(pca_r), glue::glue("{tilename}_"))
+    
+    all <- c(r, pca_r)
+    
+    masked <- mask(all, mask)
+    
+    df <- as.data.frame(masked, xy = T) %>%
+      mutate(tilename) %>%
+      unite(col = strata, ends_with("bin"), sep = "-") %>%
+      left_join(bec_tab, by = c("bec" = "value")) %>%
+      select(-bec)
+    
+    
+    # THIS LINE MAKES THE TREATMENT
+    df <- df %>%
+      # fixes the mismatch between gcy and disturbance
+      # if they both don't agree there is a disturbance
+      # there is no disturbance
+      # this impacts an extremenly small amount of pxiels
+      # ~15000 across the etnire provice
+      # this does not update it in the raster
+      # so this ALSO has to be done whene generating the grouped counts!!!
+      mutate(
+        gcy = ifelse(disturbance == 0, 0, gcy),
+        disturbance = ifelse(gcy == 0, 0, disturbance)
+      ) %>%
+      mutate(treatment = bc_albers_footprint == 0 &
+               disturbance == 0 & !is.na(bc_pa_wpdaid))
+    
+    splits <- df %>%
+      group_by(ZONE, forests, strata) %>%
+      group_split()
+    
+    splits %>%
+      map(\(y) {
+        md <- head(y, 1)
+        
+        bec <- md$ZONE
+        forests = keys$vlce %>%
+          filter(class_val == md$forests) %>%
+          pull(class_name)
+        strata <- md$strata
+        
+        # message(glue::glue("Tile: {tilename}\n BEC: {bec}\n Forest Class: {forests}\n Strata: {strata}"))
+        # message()
+        
+        split_save = here::here(split_loc,
+                                bec,
+                                forests,
+                                strata,
+                                glue::glue("{tilename}.parquet"))
+        
+        if (!dir.exists(dirname(split_save))) {
+          dir.create(dirname(split_save))
+        }
+        
+        write_parquet(y, split_save)
+        split_save
+      })
+    
+    write_parquet(df, sink = tile_sname)
+    
+    out <- df %>%
+      count(ZONE, strata, forests, treatment)
+    
+    return(out)
+  }, .progress = list(total = length(base_tiles) %>% as.numeric(),
+                 format = "{cli::pb_spin} Processing {cli::pb_current}/{cli::pb_total} | {cli::pb_eta_str}"))
+  
+  write_parquet(bsft_counts, bsft_count_loc)
+}
+
+bsft_counts <- read_parquet(bsft_count_loc)
+```
+
+```{r}
+# make folder structure in splits
+treat_loc <- here::here(pq_loc, "treat")
+dir.create(treat_loc, showWarnings = F)
+
+crossing(zones, ftypes) %>% 
+  mutate(dir = here::here(treat_loc, zones, ftypes)) %>%
+  pull(dir) %>%
+  map(dir.create, recursive = T, showWarnings = F)
+
+bsft_summed <- bsft_counts %>%
+  group_by(ZONE, forests, strata, treatment) %>%
+  summarize(n = sum(n))
+
+wide_bsft <- bsft_summed %>%
+  filter(!is.na(treatment)) %>% # weird broken pixels
+  filter(!is.na(ZONE)) %>% # edge pixels, fixed in next iteration, if not, they
+  # aren't included in the bc bounds given by bcmaps::BEC() and are part of another province
+  ungroup() %>%
+  mutate(treatment = if_else(treatment, "treat", "untreat")) %>%
+  complete(ZONE, strata, forests, treatment, fill = list(n = 0)) %>%
+  pivot_wider(names_from = treatment, values_from = n) %>%
+  filter(!(treat == 0 & untreat == 0)) %>%
+  left_join(keys$vlce %>%
+              select(forests = class_val, class_name)) %>%
+  select(-forests) %>%
+  rename(forests = class_name) %>%
+  mutate(split_folder = here::here(split_loc, 
+                                   ZONE,
+                                   forests,
+                                   strata),
+         treat_file = treat_loc <- here::here(treat_loc,
+                                 ZONE,
+                                 forests,
+                                 glue::glue("{strata}.parquet"))) %>%
+  separate(strata, into = c(cov_names)) %>%
+  mutate(across(DEM:clim_MAP, as.numeric))
+
+n_tosample <- 100
+
+wide_bsft %>%
+  group_by(ZONE, forests) %>%
+  group_split() %>%
+  map(\(x) {
+    x <- x %>%
+      mutate(rn_x = row_number())
+    
+    md <- x[1, ]
+    zone <- md$ZONE
+    class <- md$forests
+    
+    message(zone)
+    message(class)
+    message()
+    
+    if(x$treat %>% sum() == 0) {
+      return()
+    }
+    
+    t <- x %>%
+      filter(treat > 0) %>%
+      mutate(rn_t = row_number())
+    
+    
+    
+    # return if proper number of files already exists
+    if (length(list.files(here::here(split_loc, zone, class), no.. = T)) ==
+        length(list.files(here::here(treat_loc, zone, class)))) {
+      return()
+    }
+    
+    # get nearest neighbour of all strata to other stratas with treated pixels
+    nn <- FNN::get.knnx(t %>%
+                          select(DEM:clim_MAP), x %>%
+                          select(DEM:clim_MAP), k = nrow(t))
+    order <- nn$nn.index %>%
+      as.table() %>%
+      as.data.frame() %>%
+      mutate(Var1 = as.numeric(Var1), Var2 = as.numeric(Var2)) %>%
+      rename(rn_x = Var1,
+             nn_order = Var2,
+             rn_t = Freq)
+    
+    dist <- nn$nn.dist %>%
+      as.table() %>%
+      as.data.frame() %>%
+      mutate(Var1 = as.numeric(Var1), Var2 = as.numeric(Var2)) %>%
+      rename(rn_x = Var1,
+             nn_order = Var2,
+             nn_dist = Freq)
+    
+    nn_df <- left_join(order, dist) %>%
+      arrange(rn_x)
+    
+    nn_nest <- nn_df %>%
+      left_join(t %>%
+                  select(split_folder, treat, rn_t)) %>%
+      group_by(rn_x) %>%
+      mutate(treat_cs = cumsum(treat)) %>%
+      group_by(rn_x, nn_dist) %>%
+      mutate(treat_cs = max(treat_cs)) %>%
+      group_by(rn_x) %>%
+      filter(treat_cs <= min(treat_cs[treat_cs >= n_tosample])) %>%
+      mutate(data = map(split_folder, \(folder) {
+        open_dataset(folder) %>%
+          filter(treatment) %>%
+          collect()
+      })) %>%
+      unnest(data)
+    
+    # add a jittered column, so that slice minimum doesn't grab everythign with
+    # the same nn_dist
+    # if you make the sd very small, it still adds variation, but prevents ties
+    sampled <- nn_nest %>%
+      mutate(rn = row_number(),
+             adj = rnorm(n(), 0, 0.001), 
+             nn_dist_jitter = nn_dist + adj,
+             slice_by = case_when(length(unique(nn_dist)) == 1 ~ nn_dist, # Use original if all values are the same
+                                TRUE ~ nn_dist_jitter)) %>% # minimize nn_dist if more than one nn_dist to select from
+      select(-adj, -nn_dist_jitter) %>%
+      slice_min(order_by = slice_by, n = 100) %>%
+      select(rn_x, nn_dist, x:treatment) %>%
+      nest()
+    
+    x %>%
+      left_join(sampled) %>%
+      mutate(data = walk2(
+        .x = data,
+        .y = treat_file,
+        .f = write_parquet,
+        .progress = "Inner"
+      ))
+  }, .progress = "Outer")
+```
+
+```{r}
+sigma_split_loc <- here::here(pq_loc, "sigma_splits")
+dir.create(sigma_split_loc, showWarnings = F)
+
+crossing(zones, ftypes) %>% 
+  mutate(dir = here::here(sigma_split_loc, zones, ftypes)) %>%
+  pull(dir) %>%
+  map(dir.create, recursive = T, showWarnings = F)
+
+
+sigma_tiles_loc_pq <- here::here(pq_loc, "sigma_tiles")
+dir.create(sigma_tiles_loc_pq, showWarnings = F)
+
+list.files(tile_loc, pattern = ".dat$") %>% 
+  tools::file_path_sans_ext() %>%
+  here::here(sigma_tiles_loc_pq, .) %>%
+  map(dir.create, showWarnings = F)
+
+
+save_by_tile <- function(df) {
+  md <- head(df, 1)
+  
+  tile <- md %>%
+    pull(tilename)
+  # message(tile)
+  zone <- md$ZONE
+  class <- keys$vlce %>%
+    filter(class_val == md$forests) %>%
+    pull(class_name)
+  strata <- md$strata
+  
+  savename_in <- glue::glue("{zone}_{class}_{strata}.parquet")
+  
+  savepath = here::here(sigma_tiles_loc_pq, tile, savename_in)
+  
+  write_parquet(df, savepath)
+  
+  savepath
+}
+
+
+calc_sigma <- function(split_file, treat_file, matched_bec) {
+  class <- dirname(split_file) %>% basename()
+  zone <- dirname(split_file) %>% dirname() %>% basename()
+  
+  savename <- here::here(sigma_split_loc, zone, class, 
+                         glue::glue("{basename(split_file)}.parquet"))
+  if (file.exists(savename)) return(savename)
+  
+  if(!file.exists(treat_file)) {
+    
+    tibble(treat_file) %>%
+      write_csv(here::here(data_loc, "missing_treats.csv"), append = T)
+    
+    return(NA)
+  }
+  
+  split <- open_dataset(split_file) %>%
+    collect()
+  
+  
+  treat <- read_parquet(treat_file)
+  
+  filt_centres <- treat %>%
+    summarize(across(all_1:function_2, \(x) mean(x, na.rm = T)))
+  
+  # if you want to use local standard deviations
+  filt_sds <- treat %>%
+    summarize(across(all_1:function_2, \(x) sd(x, na.rm = T)))
+  
+  local_nn <- treat %>%
+    summarize(nn = mean(nn_dist)) %>%
+    as.numeric()
+  
+  out <- split %>%
+    select(starts_with("function_") |
+             starts_with("all_") |
+             starts_with("structure_")) %>%
+    mutate(across(
+      starts_with("function_") |
+        starts_with("all_") |
+        starts_with("structure_"),
+      \(x) {
+        # get mean from the filtered centre variables
+        mn <- filt_centres %>%
+          select(cur_column()) %>%
+          as.numeric()
+        
+        # get sd from global pca standard deviations
+        sd_local <- filt_sds %>%
+          select(cur_column()) %>%
+          as.numeric()
+
+        sd_global <- glob_sds %>%
+          select(cur_column()) %>%
+          as.numeric()
+
+        sd <- min(sd_local, sd_global)
+        
+        # calc standardized euclidean distance
+        # the sqrt is following equation 5 of mahony et al 2017
+        # note that we standardize by VARIANCE
+        (x - mn) ^ 2 / sd ^ 2
+      }
+    )) %>%
+    mutate(
+      fun = rowSums(across(starts_with("function_"))),
+      str = rowSums(across(starts_with("structure_"))),
+      all = rowSums(across(starts_with("all_")))
+    ) %>%
+    select(fun, str, all) %>%
+    mutate(across(everything(), \(x) sqrt(x))) %>%
+    mutate(across(everything(), \(x) {
+      # number of PCs of interest for this group of variables
+      n_df <- df_tab %>%
+        select(cur_column()) %>%
+        as.numeric()
+      
+      # percentile of the nearest neighbour distance on the chi distribution
+      # with degrees of freedom equaling the dimensionality of the distance measurement (PCs)
+      # the chi distribution 
+      perc <- pchisq(x^2, df = n_df)
+      # values of the chi percentiles on a standard half-normal distribution
+      # (chi distribution with one degree of freedom)
+      sqrt(qchisq(perc, df = 1))
+    }))
+  
+  names(out) <- glue::glue("sigma_{names(out)}")
+  
+  out_clean <- split %>%
+    select(tilename, ZONE, forests, strata, treatment, x, y,) %>%
+    bind_cols(., out) %>%
+    mutate(nn_dist = local_nn,
+           matched_bec = matched_bec) 
+  
+  out_clean %>%
+    group_by(tilename) %>%
+    group_split() %>%
+    map(save_by_tile)
+  
+  
+  out_clean %>%
+    write_parquet(sink = savename)
+  
+  savename
+}
+
+
+file_loc_dfs <- wide_bsft %>%
+  # sort so progress makes more sense
+  arrange(ZONE, forests, DEM, slope, clim_MWMT, clim_MCMT, clim_MAT, clim_MAP) %>%
+  select(ZONE, forests, split_folder, treat_file) %>%
+  mutate(sigma_pq_loc = map2_chr(.x = split_folder, 
+                             .y = treat_file, 
+                             .f = calc_sigma,
+                             matched_bec = 1,
+         .progress = list(total = nrow(wide_bsft) %>% as.numeric(),
+                          format = "{cli::pb_spin} Processing {cli::pb_current}/{cli::pb_total} | {cli::pb_eta_str}")))
+```
+
+```{r}
+# these guys have no treated similar pixels within their BEC zone.
+# we replace their treat file name so that the previous block of code
+# can still detect them.
+# this is important as it does not silently match to other BEC zones
+# we need to do this for coverage
+# but it's important that we can report that we did it and how much coverage
+# by zone there is
+no_treat <- file_loc_dfs %>%
+  left_join(wide_bsft) %>%
+  mutate(treat_file = str_replace(treat_file, ".parquet", "_nb.parquet"))
+
+no_treat %>%
+  filter(is.na(sigma_pq_loc)) %>%
+  left_join(wide_bsft) %>%
+  arrange(desc(untreat)) 
+
+# now i am going to find similar treated pixels across the entirety of BC for
+# these pixels
+no_treat %>%
+  filter(is.na(sigma_pq_loc)) %>%
+  group_by(forests) %>%
+  group_split() %>%
+  map(\(x) {
+    x <- x %>%
+      mutate(rn_x = row_number())
+    
+    md <- x[1, ]
+    class <- md$forests
+    
+    message(class)
+    message()
+    
+    # this searches all stratum across the entire province, ignoring
+    # bec zone. it is still concerned with forest type
+    t <- wide_bsft %>%
+      filter(forests == forests) %>%
+      filter(treat > 0) %>%
+      mutate(rn_t = row_number())
+    
+    # get nearest neighbour of all strata to other stratas with treated pixels
+    nn <- FNN::get.knnx(t %>%
+                          select(DEM:clim_MAP), 
+                        x %>%
+                          select(DEM:clim_MAP), 
+                        k = nrow(t))
+    
+    order <- nn$nn.index %>%
+      as.table() %>%
+      as.data.frame() %>%
+      mutate(Var1 = as.numeric(Var1), Var2 = as.numeric(Var2)) %>%
+      rename(rn_x = Var1,
+             nn_order = Var2,
+             rn_t = Freq)
+    
+    dist <- nn$nn.dist %>%
+      as.table() %>%
+      as.data.frame() %>%
+      mutate(Var1 = as.numeric(Var1), Var2 = as.numeric(Var2)) %>%
+      rename(rn_x = Var1,
+             nn_order = Var2,
+             nn_dist = Freq)
+    
+    nn_df <- left_join(order, dist) %>%
+      arrange(rn_x)
+    
+    nn_nest <- nn_df %>%
+      left_join(t %>%
+                  select(split_folder, treat, rn_t)) %>%
+      group_by(rn_x) %>%
+      mutate(treat_cs = cumsum(treat)) %>%
+      group_by(rn_x, nn_dist) %>%
+      mutate(treat_cs = max(treat_cs)) %>%
+      group_by(rn_x) %>%
+      filter(treat_cs <= min(treat_cs[treat_cs >= n_tosample])) %>%
+      mutate(data = map(split_folder, \(folder) {
+        open_dataset(folder) %>%
+          filter(treatment) %>%
+          collect()
+      })) %>%
+      unnest(data)
+    
+    # add a jittered column, so that slice minimum doesn't grab everythign with
+    # the same nn_dist
+    # if you make the sd very small, it still adds variation, but prevents ties
+    sampled <- nn_nest %>%
+      mutate(rn = row_number(),
+             adj = rnorm(n(), 0, 0.001), 
+             nn_dist_jitter = nn_dist + adj,
+             slice_by = case_when(length(unique(nn_dist)) == 1 ~ nn_dist, # Use original if all values are the same
+                                TRUE ~ nn_dist_jitter)) %>% # minimize nn_dist if more than one nn_dist to select from
+      select(-adj, -nn_dist_jitter) %>%
+      slice_min(order_by = slice_by, n = 100) %>%
+      select(rn_x, nn_dist, x:treatment) %>%
+      nest()
+    
+    x %>%
+      left_join(sampled) %>%
+      mutate(data = walk2(
+        .x = data,
+        .y = treat_file,
+        .f = write_parquet,
+        .progress = "Inner"
+      ))
+  }, .progress = "Outer")
+
+
+# this is a second pass of the entire dataset. the only difference is
+# the treatment files for missing bec/forest stratum are filled in with
+# the province wide best match, rather than the BEC best match
+# because no match is available
+# we do a full second pass because it outputs to column in the dataframe
+# and i may need that information in the future,
+# although at this point i do think i move to the tiles
+file_loc_dfs <- no_treat %>%
+  # sort so progress makes more sense
+  arrange(ZONE, forests, DEM, slope, clim_MWMT, clim_MCMT, clim_MAT, clim_MAP) %>%
+  select(ZONE, forests, split_folder, treat_file) %>%
+  mutate(sigma_pq_loc = map2_chr(.x = split_folder, 
+                             .y = treat_file, 
+                             .f = calc_sigma,
+                             matched_bec = 0,
+         .progress = list(total = nrow(wide_bsft) %>% as.numeric(),
+                          format = "{cli::pb_spin} Processing {cli::pb_current}/{cli::pb_total} | {cli::pb_eta_str}")))
+
+```
+
+rebuilding from the tiles first we need to to convert the parquets into rasters. hopefully i can do a multiband raster at the same time if not i guess ill just fuck myself then we make a vrt of all the tiles and just save em thats it thats the mosaic
+
+```{r}
+sigma_folders <- list.files(sigma_tiles_loc_pq, full.names = T)
+
+# sort base tiles so i can tell how far in we are
+tilenos <- as.numeric(gsub(".*tile_(\\d+)", "\\1", sigma_folders))
+
+sigma_folders <- sigma_folders[order(tilenos)]
+
+sigma_tile_loc <- here::here(rst_loc, "tiles_sigma")
+dir.create(sigma_tile_loc, showWarnings = T)
+
+sigma_folders %>%
+  map(\(folder) {
+    tilename <- glue::glue("{basename(folder)}.dat")
+    
+    savename <- here::here(sigma_tile_loc, tilename)
+    if(file.exists(savename)) {return(savename)}
+    if(length(list.files(folder)) == 0) {return()}
+    
+    template <- here::here(tile_loc, tilename) %>%
+      rast() 
+    
+    template_df <- template %>%
+      as.data.frame(xy = T) %>%
+      select(x, y)
+    
+    df <- open_dataset(folder) %>%
+      select(x, y, starts_with("sigma"), nn_dist, matched_bec) %>%
+      collect()
+    
+    template_df %>% 
+      left_join(df) %>% 
+      rast(crs = "epsg:3005", extent = template) %>%
+      writeRaster(filename = savename, filetype = "envi")
+    
+    return(savename)
+  }, .progress = list(total = length(sigma_folders) %>% as.numeric(),
+                          format = "{cli::pb_spin} Processing {cli::pb_current}/{cli::pb_total} | {cli::pb_eta_str}"))
+```
+
+```{r}
+sigma_tiles <- list.files(sigma_tile_loc, pattern = ".dat$", full.names = T)
+sigma_names <- names(sigma_tiles[[1]] %>%
+                       rast())
+
+sigma_bc_savename <- here::here(output_loc, "sigma_nn_dist.dat")
+
+if (!file.exists(sigma_bc_savename)) {
+  sigma_vrt <- sigma_tiles %>%
+    vrt()
+  
+  names(sigma_vrt) <- sigma_names
+  
+  writeRaster(sigma_vrt,
+              sigma_bc_savename,
+              filetype = "envi")
+}
+
+# pca_tib <- tibble(filename = pca_tiles) %>%
+#   mutate(suffix = gsub(".*_(.*?)\\.dat", "\\1", filename)) %>%
+#   group_by(suffix) %>%
+#   summarise(files = list(filename), .groups = "drop")
+# 
+# 
+# pca_tib %>%
+#   mutate(file_loc = map2(files, suffix, \(files, name) {
+#     savename <- here::here(output_loc, glue::glue("pca_{name}.dat"))
+#     print(savename)
+#     if(file.exists(savename)) {
+#       return(savename)
+#     }
+#     
+#     vrt <- files %>%
+#       vrt()
+#     
+#     names(vrt) <- glue::glue("{name}_{1:nlyr(vrt)}")
+#     
+#     writeRaster(vrt,
+#                 savename,
+#                 filetype = "envi")
+#     savename
+#   }))
+```
